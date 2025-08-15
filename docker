@@ -1,0 +1,25 @@
+# Lightweight, GPU-ready not required, but works fine on GPU as well.
+FROM python:3.11-slim
+
+# For faster installs and proper locales
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /workspace
+
+# System deps for transformers/pandas/scipy (BLAS, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget curl build-essential python3-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Bring in the upstream code
+RUN git clone https://github.com/IBM/diveye.git /workspace
+# Add our serverless handler + requirements
+COPY requirements.txt /workspace/requirements.txt
+RUN pip install -r /workspace/requirements.txt
+
+# copy handler into container root for clarity (Runpod convention-friendly)
+COPY rp_handler.py /rp_handler.py
+
+# Default command expected by Runpod
+CMD ["python", "-u", "/rp_handler.py"]
