@@ -1,68 +1,62 @@
-import os, json, subprocess, tempfile, pathlib, shlex
+import os, json, subprocess, tempfile, pathlib, shlex, base64, csv
 import runpod
 
-# Helper: if user passes a URL, we download; if path, we use it directly.
-def _materialize_csv(src: str, workdir: str, filename: str) -> str:
-    p = pathlib.Path(workdir) / filename
-    if src.startswith("http://") or src.startswith("https://"):
-        import urllib.request
-        urllib.request.urlretrieve(src, p.as_posix())
-        return p.as_posix()
-    # allow mounted volume paths or relative paths in image
-    src_p = pathlib.Path(src)
-    if src_p.exists():
-        return src_p.as_posix()
-    raise FileNotFoundError(f"CSV not found or bad URL: {src}")
+def _write_b64(b64_str, path):
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(b64_str))
+    return path
 
-def _run(cmd_list, cwd=None):
-    proc = subprocess.run(cmd_list, cwd=cwd, text=True, capture_output=True)
-    return proc.returncode, proc.stdout, proc.stderr
+def _download(url, path):
+    import urllib.request
+    urllib.request.urlretrieve(url, path)
+    return path
+
+def _materialize(inp, key_url, key_b64, default_name, workdir):
+    p = pathlib.Path(workdir) / default_name
+    if inp.get(key_b64):
+        return _write_b64(inp[key_b64], p.as_posix())
+    if inp.get(key_url):
+        return _download(inp[key_url], p.as_posix())
+    return None
 
 def handler(event):
-    """
-    Expected event['input']:
-      {
-        "model": "distilroberta-base",        # any HF model name (required)
-        "train_csv": "<URL or path>",         # required
-        "test_csv": "<URL or path>",          # required
-        "extra_args": "--foo bar"             # optional passthrough to diveye.py
-      }
-    Returns:
-      { "status": "ok", "stdout": "...", "stderr": "..."}  OR  {"status":"error", ...}
-    """
     inp = event.get("input", {})
     model = inp.get("model")
-    train_src = inp.get("train_csv")
-    test_src  = inp.get("test_csv")
     extra = inp.get("extra_args", "")
 
-    if not model or not train_src or not test_src:
-        return {"status": "error", "message": "Required fields: model, train_csv, test_csv"}
+    if not model:
+        return {"status": "error", "message": "model is required"}
 
     with tempfile.TemporaryDirectory() as td:
-        train_csv = _materialize_csv(train_src, td, "train.csv")
-        test_csv  = _materialize_csv(test_src, td, "test.csv")
+        # Accept base64 or URL for train/test CSVs
+        train_csv = _materialize(inp, "train_csv", "train_csv_b64", "train.csv", td)
+        test_csv  = _materialize(inp, "test_csv",  "test_csv_b64",  "test.csv",  td)
 
-        # Build command to call the original CLI
-        cmd = [
-            "python3", "diveye.py",
-            f"--model={model}",
-            f"--train_dataset={train_csv}",
-            f"--test_dataset={test_csv}"
-        ]
+        # Convenience: if user passed raw text, make a one-row test.csv
+        if not test_csv and inp.get("test_text"):
+            test_csv = os.path.join(td, "test.csv")
+            with open(test_csv, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["text"])
+                w.writerow([inp["test_text"]])
 
+        if not train_csv or not test_csv:
+            return {"status": "error",
+                    "message": "Need at least train_csv(_b64) and test_csv(_b64) or test_text."}
+
+        cmd = ["python3", "diveye.py",
+               f"--model={model}",
+               f"--train_dataset={train_csv}",
+               f"--test_dataset={test_csv}"]
         if extra:
-            # naive split; keep simple flags space-separated
             cmd.extend(shlex.split(extra))
 
-        code, out, err = _run(cmd, cwd="/workspace")
-
-        result = {
-            "status": "ok" if code == 0 else "error",
-            "exit_code": code,
-            "stdout": out[-30000:],   # trim huge logs
-            "stderr": err[-30000:]
+        proc = subprocess.run(cmd, cwd="/workspace", text=True, capture_output=True)
+        return {
+            "status": "ok" if proc.returncode == 0 else "error",
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout[-30000:],
+            "stderr": proc.stderr[-30000:]
         }
-        return result
 
 runpod.serverless.start({"handler": handler})
